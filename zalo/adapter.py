@@ -145,7 +145,7 @@ class ZaloAdapter(BasePlatformAdapter):
         self._redacted_token = self._redact_token(self.bot_token)
 
         # DM policy
-        self.dm_policy = extra.get("dm_policy", "pairing")
+        self.dm_policy = extra.get("dm_policy", "open")
 
         # Allowed users (authorisation)
         allowed_env = os.getenv("ZALO_ALLOWED_USERS", "").strip()
