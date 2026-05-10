@@ -1,0 +1,40 @@
+# Example configuration for Hermes Zalo Plugin
+#
+# Copy this to ~/.hermes/config.yaml or your project config.
+# Environment variables override config.yaml values.
+
+gateway:
+  platforms:
+    zalo:
+      enabled: true
+      extra:
+        # === Required ===
+        # Bot token from https://bot.zaloplatforms.com
+        bot_token: "12345678:abc-def-xyz"
+
+        # === Access Control ===
+        # Available policies:
+        #   "pairing"   — new users get a 6-digit code to approve (default)
+        #   "open"      — any user can message
+        #   "allowlist" — only users in allowed_users can message
+        dm_policy: "pairing"
+
+        # User IDs allowed to talk to the bot (used with allowlist policy)
+        # Format: Zalo user IDs
+        allowed_users: []
+
+        # Allow all users (true/false). Overrides allowed_users.
+        allow_all: true
+
+        # === Webhook Mode (Optional) ===
+        # If set, uses webhook instead of long-polling.
+        # webhook_url and webhook_secret are mutually exclusive with polling.
+        webhook_url: ""
+        webhook_secret: ""
+        webhook_port: 8443
+
+# Environment variable equivalents:
+#   ZALO_BOT_TOKEN         -> extra.bot_token
+#   ZALO_ALLOWED_USERS     -> extra.allowed_users
+#   ZALO_ALLOW_ALL_USERS   -> extra.allow_all
+#   ZALO_HOME_CHANNEL      -> home channel for cron delivery

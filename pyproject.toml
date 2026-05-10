@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "hermes-plugin-zalo"
+version = "1.0.0"
+description = "Zalo Bot Platform gateway adapter for Hermes Agent"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.11"
+authors = [
+    {name = "Moken", email = "jarvis.hermes.ai@gmail.com"},
+]
+keywords = ["hermes-agent", "zalo", "plugin", "messaging"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Communications :: Chat",
+]
+
+[project.urls]
+Homepage = "https://github.com/<your-username>/hermes-plugin-zalo"
+Repository = "https://github.com/<your-username>/hermes-plugin-zalo"
+"Bug Tracker" = "https://github.com/<your-username>/hermes-plugin-zalo/issues"
+
+[tool.setuptools.packages.find]
+include = ["zalo", "zalo.*"]

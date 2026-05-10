@@ -1,0 +1,36 @@
+name: zalo-platform
+label: Zalo
+kind: platform
+version: 1.0.0
+description: >
+  Zalo Bot Platform gateway adapter for Hermes Agent.
+  Connects to Zalo via the Bot API (bot.zaloplatforms.com) and relays
+  messages between Zalo DMs and the Hermes agent. Supports long-polling
+  (default) and webhook mode.
+
+  Zero extra dependencies — uses httpx, already a Hermes Agent dependency.
+author: Moken
+repository: "https://github.com/moken627-hub/hermes-plugin-zalo"
+requires_env:
+  - name: ZALO_BOT_TOKEN
+    description: "Zalo Bot API token from bot.zaloplatforms.com (format: numeric_id:secret)"
+    prompt: "Zalo Bot Token"
+    url: "https://bot.zaloplatforms.com"
+    password: true
+optional_env:
+  - name: ZALO_ALLOWED_USERS
+    description: "Comma-separated Zalo user IDs allowed to talk to the bot (empty = all)"
+    prompt: "Allowed users (comma-separated IDs)"
+    password: false
+  - name: ZALO_ALLOW_ALL_USERS
+    description: "Allow any Zalo user to talk to the bot (true/false)"
+    prompt: "Allow all users?"
+    password: false
+  - name: ZALO_HOME_CHANNEL
+    description: "Default Zalo chat ID for cron / notification delivery"
+    prompt: "Home channel chat ID"
+    password: false
+  - name: ZALO_HOME_CHANNEL_NAME
+    description: "Display name for the Zalo home channel"
+    prompt: "Home channel display name"
+    password: false
