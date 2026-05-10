@@ -97,10 +97,20 @@ class _ZaloClient:
         return await self._post("getMe")
 
     async def get_updates(self, timeout: int = POLLING_TIMEOUT) -> list:
-        """Long-poll for new updates."""
+        """Long-poll for new updates.
+
+        Returns a list of update objects (handles both single-object and
+        array response formats from the Zalo API).
+        """
         result = await self._post("getUpdates", {"timeout": timeout})
-        if result.get("ok") and isinstance(result.get("result"), list):
-            return result["result"]
+        if not result.get("ok"):
+            return []
+        raw = result.get("result")
+        if isinstance(raw, list):
+            return raw
+        if isinstance(raw, dict):
+            # Single object — wrap in list for uniform handling
+            return [raw]
         return []
 
     async def send_message(self, chat_id: str, text: str) -> dict:
@@ -144,8 +154,8 @@ class ZaloAdapter(BasePlatformAdapter):
         self.bot_token = self.bot_token.strip()
         self._redacted_token = self._redact_token(self.bot_token)
 
-        # DM policy
-        self.dm_policy = extra.get("dm_policy", "open")
+        # DM policy (env var overrides config.yaml)
+        self.dm_policy = os.getenv("ZALO_DM_POLICY") or extra.get("dm_policy", "pairing")
 
         # Allowed users (authorisation)
         allowed_env = os.getenv("ZALO_ALLOWED_USERS", "").strip()
@@ -170,6 +180,8 @@ class ZaloAdapter(BasePlatformAdapter):
         self._poll_task: Optional[asyncio.Task] = None
         self._webhook_runner: Optional[asyncio.Task] = None
         self._bot_info: Optional[dict] = None
+        self._bot_id: str = ""
+        self._bot_name: str = ""
         self._pending_approvals: Dict[str, dict] = {}  # chat_id -> approval info
 
     def _redact_token(self, token: str) -> str:
@@ -209,6 +221,8 @@ class ZaloAdapter(BasePlatformAdapter):
                 )
                 return False
             self._bot_info = me.get("result", {})
+            self._bot_id = str(self._bot_info.get("id", ""))
+            self._bot_name = self._bot_info.get("account_name", "")
             logger.info(
                 "Zalo: verified bot '%s' (id=%s, type=%s)",
                 self._bot_info.get("account_name", "?"),
@@ -372,17 +386,71 @@ class ZaloAdapter(BasePlatformAdapter):
         user_name = from_info.get("display_name", user_id)
         chat_id = str(chat_info.get("id", user_id))
         chat_type = chat_info.get("chat_type", "PRIVATE")
+        raw_text = (message.get("text") or message.get("caption") or "").strip()
 
         # Ignore bot's own messages
         if from_info.get("is_bot", False):
             return
 
-        # Only handle DMs for now (group support experimental)
-        if chat_type != "PRIVATE":
-            logger.debug("Zalo: ignoring non-DM message (type=%s)", chat_type)
+        # Determine message type and extract text/media
+        message_type = MessageType.TEXT
+        media_url = None
+        text = raw_text
+
+        if event_name == "message.image.received":
+            message_type = MessageType.IMAGE
+            media_url = message.get("photo", "")
+            if not text and message.get("caption"):
+                text = message["caption"]
+        elif event_name == "message.sticker.received":
+            message_type = MessageType.STICKER
+            text = message.get("sticker", "") or message.get("url", "") or "[Sticker]"
+        elif event_name == "message.unsupported.received":
+            text = "[Unsupported message type]"
+
+        # ── Group message handling ──────────────────────────────────────
+        is_group = chat_type == "GROUP"
+        if is_group:
+            # Check if bot is mentioned: @mention or reply to bot
+            mentioned = False
+
+            # 1. Check @mention (display_name)
+            if self._bot_name and self._bot_name in text:
+                mentioned = True
+
+            # 2. Check reply
+            if message.get("reply_to"):
+                reply_to = message["reply_to"]
+                if isinstance(reply_to, dict) and reply_to.get("from", {}).get("id") == self._bot_id:
+                    mentioned = True
+
+            if not mentioned:
+                logger.debug("Zalo: ignoring group message — bot not mentioned")
+                return
+
+            # Strip bot mention from text
+            if self._bot_name:
+                text = text.replace(f"@{self._bot_name}", "").replace(f"{self._bot_name}", "").strip()
+
+            # Auth check for group (check the user who sent it)
+            if not self._is_user_authorized(user_id):
+                logger.debug("Zalo: ignoring group message from unauthorized user %s", user_id)
+                return
+
+            # Dispatch group message
+            await self._dispatch_message(
+                text=text,
+                chat_id=chat_id,
+                user_id=user_id,
+                user_name=user_name,
+                message_type=message_type,
+                media_url=media_url,
+                chat_type="group",
+            )
             return
 
-        # Pairing approval flow
+        # ── DM handling ─────────────────────────────────────────────────
+        # DM pairing approval flow (only for PRIVATE chats)
         if self.dm_policy == "pairing":
             if chat_id not in self._pending_approvals:
                 # First contact — generate pairing code
@@ -424,24 +492,7 @@ class ZaloAdapter(BasePlatformAdapter):
             logger.debug("Zalo: ignoring message from unauthorized user %s", user_id)
             return
 
-        # Build and dispatch message
-        text = message.get("text") or message.get("caption") or ""
-
-        # Handle different event types
-        message_type = MessageType.TEXT
-        media_url = None
-
-        if event_name == "message.image.received":
-            message_type = MessageType.IMAGE
-            media_url = message.get("photo", "")
-            if not text and message.get("caption"):
-                text = message["caption"]
-        elif event_name == "message.sticker.received":
-            message_type = MessageType.STICKER
-            text = message.get("sticker", "") or message.get("url", "") or "[Sticker]"
-        elif event_name == "message.unsupported.received":
-            text = "[Unsupported message type]"
-
+        # Dispatch
         await self._dispatch_message(
             text=text,
             chat_id=chat_id,
@@ -449,6 +500,7 @@ class ZaloAdapter(BasePlatformAdapter):
             user_name=user_name,
             message_type=message_type,
             media_url=media_url,
+            chat_type="dm",
         )
 
     async def _send_pairing_code(self, chat_id: str, code: str, user_name: str) -> None:
@@ -478,6 +530,7 @@ class ZaloAdapter(BasePlatformAdapter):
         user_name: str,
         message_type: MessageType = MessageType.TEXT,
         media_url: str = None,
+        chat_type: str = "dm",
     ) -> None:
         """Build a MessageEvent and hand it to the base class handler."""
         if not self._message_handler:
@@ -485,8 +538,8 @@ class ZaloAdapter(BasePlatformAdapter):
 
         source = self.build_source(
             chat_id=chat_id,
-            chat_name=user_name,
-            chat_type="dm",
+            chat_name=chat_id if chat_type == "group" else user_name,
+            chat_type=chat_type,
             user_id=user_id,
             user_name=user_name,
         )
