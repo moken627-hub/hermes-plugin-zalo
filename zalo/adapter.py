@@ -168,7 +168,7 @@ class ZaloAdapter(BasePlatformAdapter):
         if allow_all_env:
             self.allow_all = allow_all_env in ("1", "true", "yes")
         else:
-            self.allow_all = extra.get("allow_all", True)
+            self.allow_all = extra.get("allow_all", False)
 
         # Webhook mode
         self.webhook_url = extra.get("webhook_url", "")
@@ -300,15 +300,18 @@ class ZaloAdapter(BasePlatformAdapter):
                     if not message:
                         continue
 
-                    await self._handle_incoming(event_name, message)
-
-                    # Track the last update ID to avoid duplicates
+                    # Skip already-processed messages
                     mid = message.get("message_id", "") or update.get("message_id", "")
                     if mid:
                         try:
-                            last_update_id = int(mid, 16)  # hex string
+                            mid_int = int(mid, 16)
+                            if mid_int <= last_update_id:
+                                continue
+                            last_update_id = mid_int
                         except (ValueError, TypeError):
                             pass
+
+                    await self._handle_incoming(event_name, message)
 
             except asyncio.CancelledError:
                 raise
@@ -333,6 +336,7 @@ class ZaloAdapter(BasePlatformAdapter):
                 "Install it with: pip install aiohttp"
             )
             # Fall back to polling
+            self.webhook_url = ""  # clear so connect() logs correct mode
             logger.info("Zalo: falling back to long-polling")
             await self._start_polling()
             return
@@ -454,7 +458,8 @@ class ZaloAdapter(BasePlatformAdapter):
         if self.dm_policy == "pairing":
             if chat_id not in self._pending_approvals:
                 # First contact — generate pairing code
-                code = str(int(time.time()))[-6:]
+                import secrets
+                code = f"{secrets.randbelow(1000000):06d}"  # 6-digit random code
                 self._pending_approvals[chat_id] = {
                     "code": code,
                     "user_id": user_id,
@@ -469,8 +474,7 @@ class ZaloAdapter(BasePlatformAdapter):
             approval = self._pending_approvals[chat_id]
             if approval.get("code"):
                 # Still pending — check if the message is the approval code
-                text = (message.get("text") or "").strip()
-                if text == approval["code"]:
+                if raw_text == approval["code"]:
                     # Approved! Remove pairing code
                     approval.pop("code", None)
                     await self._send_text(chat_id, f"✅ Xác thực thành công! Bạn có thể trò chuyện với bot.")
@@ -519,7 +523,7 @@ class ZaloAdapter(BasePlatformAdapter):
         if self.allow_all:
             return True
         if not self.allowed_users:
-            return True
+            return False  # deny all if no allowlist configured
         return user_id in self.allowed_users
 
     async def _dispatch_message(
@@ -548,7 +552,7 @@ class ZaloAdapter(BasePlatformAdapter):
             text=text,
             message_type=message_type,
             source=source,
-            message_id=str(int(time.time() * 1000)),
+            message_id=str(message.get("message_id", int(time.time() * 1000))),
             timestamp=datetime.now(),
         )
 
@@ -767,15 +771,20 @@ async def _standalone_send(
         if media_files:
             for media_url in media_files[:1]:  # only send first media
                 caption = message[:MAX_MESSAGE_LENGTH] if message else ""
-                result = await client.send_photo(chat_id, media_url, caption)
-                if result.get("ok"):
-                    return {"success": True, "message_id": result.get("result", {}).get("message_id", "")}
+                try:
+                    result = await client.send_photo(chat_id, media_url, caption)
+                    if result.get("ok"):
+                        return {"success": True, "message_id": result.get("result", {}).get("message_id", "")}
+                except Exception as e:
+                    logger.warning("Zalo: send_photo failed, falling back to text: %s", e)
 
-        # Send text
-        result = await client.send_message(chat_id, message[:MAX_MESSAGE_LENGTH])
-        if result.get("ok"):
-            return {"success": True, "message_id": result.get("result", {}).get("message_id", "")}
-        return {"error": str(result)}
+        # Send text (fallback or primary)
+        if message:
+            result = await client.send_message(chat_id, message[:MAX_MESSAGE_LENGTH])
+            if result.get("ok"):
+                return {"success": True, "message_id": result.get("result", {}).get("message_id", "")}
+            return {"error": str(result)}
+        return {"error": "No message content to send"}
     except Exception as e:
         return {"error": f"Zalo standalone send failed: {e}"}
     finally:
