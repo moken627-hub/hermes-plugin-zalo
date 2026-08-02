@@ -153,6 +153,46 @@ SLASH_COMMANDS = {
         "usage": "/info",
         "admin_only": False,
     },
+    "/mute": {
+        "description": "Mute nhóm",
+        "usage": "/mute",
+        "admin_only": True,
+    },
+    "/unmute": {
+        "description": "Unmute nhóm",
+        "usage": "/unmute",
+        "admin_only": True,
+    },
+    "/silent": {
+        "description": "Silent mode (chỉ reply khi @tag)",
+        "usage": "/silent",
+        "admin_only": True,
+    },
+    "/welcome": {
+        "description": "Bật/tắt welcome message",
+        "usage": "/welcome",
+        "admin_only": True,
+    },
+    "/welcome-text": {
+        "description": "Đặt welcome text",
+        "usage": "/welcome-text <nội dung>",
+        "admin_only": True,
+    },
+    "/follow": {
+        "description": "Bật/tắt group tracking",
+        "usage": "/follow",
+        "admin_only": True,
+    },
+    "/name-trigger": {
+        "description": "Thêm name trigger",
+        "usage": "/name-trigger <tên> <reply>",
+        "admin_only": True,
+    },
+    "/settings": {
+        "description": "Xem cài đặt nhóm",
+        "usage": "/settings",
+        "admin_only": False,
+    },
 }
 
 # ---------------------------------------------------------------------------
@@ -348,6 +388,100 @@ class _GroupManager:
         return await self._client._post("unpinGroupMessage",
                                         {"group_id": group_id, "message_id": message_id})
 
+    async def mute_group(self, group_id: str) -> Dict[str, Any]:
+        """Mute a group (bot stops receiving notifications)."""
+        return await self._client._post("muteGroup", {"group_id": group_id})
+
+    async def unmute_group(self, group_id: str) -> Dict[str, Any]:
+        """Unmute a group."""
+        return await self._client._post("unmuteGroup", {"group_id": group_id})
+
+    async def set_group_name(self, group_id: str, name: str) -> Dict[str, Any]:
+        """Rename a group."""
+        return await self._client._post("setGroupName",
+                                        {"group_id": group_id, "name": name[:100]})
+
+    async def set_group_avatar(self, group_id: str, avatar_url: str) -> Dict[str, Any]:
+        """Set group avatar from URL."""
+        return await self._client._post("setGroupAvatar",
+                                        {"group_id": group_id, "avatar_url": avatar_url})
+
+    async def get_group_invites(self, group_id: str) -> Dict[str, Any]:
+        """Get pending invites for a group."""
+        return await self._client._post("getGroupInvites", {"group_id": group_id})
+
+    async def get_group_link(self, group_id: str) -> Dict[str, Any]:
+        """Get group invite link."""
+        return await self._client._post("getGroupLink", {"group_id": group_id})
+
+    async def enable_group_link(self, group_id: str) -> Dict[str, Any]:
+        """Enable group invite link."""
+        return await self._client._post("enableGroupLink", {"group_id": group_id})
+
+    async def disable_group_link(self, group_id: str) -> Dict[str, Any]:
+        """Disable group invite link."""
+        return await self._client._post("disableGroupLink", {"group_id": group_id})
+
+
+class _GroupSettings:
+    """Per-group toggle settings (muted, silent, welcome, follow)."""
+
+    SETTINGS_FILE = os.environ.get(
+        "ZALO_SETTINGS_DIR",
+        str(Path.home() / ".hermes" / "zalo-settings"),
+    )
+
+    def __init__(self) -> None:
+        self._dir = Path(self.SETTINGS_FILE)
+        self._dir.mkdir(parents=True, exist_ok=True)
+
+    def _filepath(self, group_id: str) -> Path:
+        return self._dir / f"{group_id}.json"
+
+    def _load(self, group_id: str) -> Dict[str, Any]:
+        filepath = self._filepath(group_id)
+        if not filepath.exists():
+            return {
+                "muted": False,
+                "silent": False,
+                "welcome": False,
+                "follow": False,
+                "welcome_text": "",
+                "name_triggers": [],
+            }
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return {"muted": False, "silent": False, "welcome": False, "follow": False}
+
+    def _save(self, group_id: str, settings: Dict[str, Any]) -> None:
+        filepath = self._filepath(group_id)
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(settings, f, ensure_ascii=False, indent=2)
+
+    def get(self, group_id: str) -> Dict[str, Any]:
+        return self._load(group_id)
+
+    def set(self, group_id: str, key: str, value: Any) -> Dict[str, Any]:
+        settings = self._load(group_id)
+        settings[key] = value
+        self._save(group_id, settings)
+        return {"ok": True, "key": key, "value": value}
+
+    def set_multiple(self, group_id: str, updates: Dict[str, Any]) -> Dict[str, Any]:
+        settings = self._load(group_id)
+        settings.update(updates)
+        self._save(group_id, settings)
+        return {"ok": True, "updated": list(updates.keys())}
+
+    def toggle(self, group_id: str, key: str) -> Dict[str, Any]:
+        settings = self._load(group_id)
+        current = settings.get(key, False)
+        settings[key] = not current
+        self._save(group_id, settings)
+        return {"ok": True, "key": key, "value": settings[key]}
+
 
 class _ChatHistorySync:
     """Synchronizes Zalo chat history for agent access."""
@@ -542,6 +676,7 @@ class ZaloAdapter(BasePlatformAdapter):
         self._group_manager = _GroupManager(self._client)
         self._history_sync = _ChatHistorySync()
         self._crm = _CRMContacts()
+        self._group_settings = _GroupSettings()
 
     def _redact_token(self, token: str) -> str:
         """Redact bot token for logging (show first 4 chars + last 4)."""
@@ -1026,6 +1161,66 @@ class ZaloAdapter(BasePlatformAdapter):
                     await self._send_text(chat_id, "📢 Đã đăng thông báo nhóm")
                 else:
                     await self._send_text(chat_id, f"❌ Lỗi: {result.get('error', 'Unknown')}")
+            elif cmd == "/mute":
+                result = await self._group_manager.mute_group(chat_id)
+                if result.get("ok"):
+                    self._group_settings.set(chat_id, "muted", True)
+                    await self._send_text(chat_id, "🔇 Đã mute nhóm")
+                else:
+                    await self._send_text(chat_id, f"❌ Lỗi: {result.get('error', 'Unknown')}")
+            elif cmd == "/unmute":
+                result = await self._group_manager.unmute_group(chat_id)
+                if result.get("ok"):
+                    self._group_settings.set(chat_id, "muted", False)
+                    await self._send_text(chat_id, "🔊 Đã unmute nhóm")
+                else:
+                    await self._send_text(chat_id, f"❌ Lỗi: {result.get('error', 'Unknown')}")
+            elif cmd == "/silent":
+                settings = self._group_settings.get(chat_id)
+                new_val = not settings.get("silent", False)
+                self._group_settings.set(chat_id, "silent", new_val)
+                status = "BẬT" if new_val else "TẮT"
+                await self._send_text(chat_id, f"🔕 Silent mode {status} — {'chỉ reply khi @tag/gọi tên' if new_val else 'reply tất cả'}")
+            elif cmd == "/welcome":
+                settings = self._group_settings.get(chat_id)
+                new_val = not settings.get("welcome", False)
+                self._group_settings.set(chat_id, "welcome", new_val)
+                status = "BẬT" if new_val else "TẮT"
+                await self._send_text(chat_id, f"🎉 Welcome message {status}")
+            elif cmd == "/follow":
+                settings = self._group_settings.get(chat_id)
+                new_val = not settings.get("follow", False)
+                self._group_settings.set(chat_id, "follow", new_val)
+                status = "BẬT" if new_val else "TẮT"
+                await self._send_text(chat_id, f"📋 Group tracking {status}")
+            elif cmd == "/welcome-text":
+                text = args.strip()
+                if not text:
+                    await self._send_text(chat_id, "⚠️ Dùng: `/welcome-text <nội dung>`")
+                    return
+                self._group_settings.set(chat_id, "welcome_text", text)
+                await self._send_text(chat_id, "✅ Đã cập nhật welcome text")
+            elif cmd == "/name-trigger":
+                parts = args.strip().split(None, 1)
+                if len(parts) < 2:
+                    await self._send_text(chat_id, "⚠️ Dùng: `/name-trigger <tên> <reply>`")
+                    return
+                name = parts[0]
+                reply = parts[1]
+                triggers = self._group_settings.get(chat_id).get("name_triggers", [])
+                triggers.append({"name": name, "reply": reply})
+                self._group_settings.set(chat_id, "name_triggers", triggers)
+                await self._send_text(chat_id, f"✅ Đã thêm trigger: @{name} → {reply[:50]}")
+            elif cmd == "/settings":
+                settings = self._group_settings.get(chat_id)
+                lines = [
+                    "⚙️ **Cài đặt nhóm:**",
+                    f"  🔇 Mute: {'BẬT' if settings.get('muted') else 'TẮT'}",
+                    f"  🔕 Silent: {'BẬT' if settings.get('silent') else 'TẮT'}",
+                    f"  🎉 Welcome: {'BẬT' if settings.get('welcome') else 'TẮT'}",
+                    f"  📋 Follow: {'BẬT' if settings.get('follow') else 'TẮT'}",
+                ]
+                await self._send_text(chat_id, "\n".join(lines))
             else:
                 await self._send_text(chat_id, f"❓ Không biết lệnh `{cmd}`. Dùng `/menu` để xem danh sách.")
         except Exception as e:

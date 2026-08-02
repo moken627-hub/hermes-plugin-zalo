@@ -1,7 +1,7 @@
 name: zalo-platform
 label: Zalo
 kind: platform
-version: 2.0.0
+version: 2.1.0
 description: >
   Zalo Bot Platform gateway adapter for Hermes Agent.
   Connects to Zalo via the Bot API (bot.zaloplatforms.com) and relays
@@ -42,7 +42,15 @@ optional_env:
     description: "Directory for CRM contact data (default: ~/.hermes/zalo-crm)"
     prompt: "CRM data directory"
     password: false
+  - name: ZALO_CRM_DIR
+    description: "Directory for CRM contact data (default: ~/.hermes/zalo-crm)"
+    prompt: "CRM data directory"
+    password: false
   - name: ZALO_HISTORY_DIR
     description: "Directory for chat history sync (default: ~/.hermes/zalo-history)"
     prompt: "Chat history directory"
+    password: false
+  - name: ZALO_SETTINGS_DIR
+    description: "Directory for per-group settings (default: ~/.hermes/zalo-settings)"
+    prompt: "Settings directory"
     password: false

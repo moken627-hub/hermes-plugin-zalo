@@ -203,12 +203,19 @@ python -c "from gateway.platforms.base import BasePlatformAdapter; print('OK')"
 
 - 🎉 **Major release** — Enterprise-grade Zalo moderation and group management
 - 👥 Group management: create, kick, promote/demote admin, invite, poll, pin
-- 📝 Slash commands: /menu, /rules, /warn, /kick, /promote, /poll, /pin, /noi-quy, /info...
+- 🔇 Mute/Unmute group via Bot API
+- 🔕 Silent mode (only reply when @tagged or called by name)
+- 🎉 Welcome message for new members
+- 📋 Group tracking/follow (chat history + memory per group)
+- 🏷️ Name triggers (auto-reply when bot is mentioned by name)
+- ⚙️ Per-group toggle settings (muted, silent, welcome, follow)
+- 📊 Group settings dashboard (/settings command)
+- 📝 Slash commands: /menu, /rules, /warn, /kick, /promote, /poll, /pin, /noi-quy, /info, /mute, /unmute, /silent, /welcome, /follow, /name-trigger, /settings
 - 🛡️ Zero-token anti-spam: rate limiting + suspicious link detection
 - ⚠️ Warn system: 3-strike moderation with expiry
 - 📜 Chat history sync: JSONL-based, searchable, flush-to-disk
 - 👥 CRM contacts: add/search/list, CSV import/export, per-group labels
-- 📊 Group info, member list, announcements
+- 📊 Group info, member list, announcements, group link management
 
 ### v1.0.0 (2026-05-10)
 
