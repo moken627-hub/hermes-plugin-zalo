@@ -30,8 +30,10 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -60,6 +62,98 @@ POLLING_TIMEOUT = 30  # seconds for long-poll
 POLLING_INTERVAL = 2  # seconds between polls when no updates
 RECONNECT_DELAY = 5  # seconds before reconnecting after error
 WEBHOOK_SECRET_HEADER = "X-Bot-Api-Secret-Token"
+
+# ── Moderation constants ──────────────────────────────────────────
+ANTI_SPAM_MAX_PER_MINUTE = 5
+WARN_MAX_WARNINGS = 3
+WARN_EXPIRY_SECONDS = 604800  # 1 week
+CRM_DATA_DIR = os.environ.get(
+    "ZALO_CRM_DIR",
+    str(Path.home() / ".hermes" / "zalo-crm"),
+)
+HISTORY_DIR = os.environ.get(
+    "ZALO_HISTORY_DIR",
+    str(Path.home() / ".hermes" / "zalo-history"),
+)
+
+# ── Slash commands registry ───────────────────────────────────────
+SLASH_COMMANDS = {
+    "/noi-quy": {
+        "description": "Quy định nhóm",
+        "usage": "/noi-quy <text>",
+        "admin_only": True,
+    },
+    "/menu": {
+        "description": "Hiển thị menu lệnh",
+        "usage": "/menu",
+        "admin_only": False,
+    },
+    "/huong-dan": {
+        "description": "Hướng dẫn sử dụng bot",
+        "usage": "/huong-dan",
+        "admin_only": False,
+    },
+    "/warn": {
+        "description": "Cảnh báo thành viên",
+        "usage": "/warn @user <reason>",
+        "admin_only": True,
+    },
+    "/unwarn": {
+        "description": "Xóa cảnh báo thành viên",
+        "usage": "/unwarn @user",
+        "admin_only": True,
+    },
+    "/report": {
+        "description": "Báo cáo vi phạm",
+        "usage": "/report @user <reason>",
+        "admin_only": True,
+    },
+    "/rules": {
+        "description": "Quy tắc nhóm",
+        "usage": "/rules",
+        "admin_only": False,
+    },
+    "/poll": {
+        "description": "Tạo poll",
+        "usage": "/poll <question> | option1, option2, ...",
+        "admin_only": True,
+    },
+    "/pin": {
+        "description": "Ghim tin nhắn",
+        "usage": "/pin <message_id>",
+        "admin_only": True,
+    },
+    "/unpin": {
+        "description": "Bỏ ghim tin nhắn",
+        "usage": "/unpin <message_id>",
+        "admin_only": True,
+    },
+    "/invite": {
+        "description": "Mời thành viên",
+        "usage": "/invite @user1, @user2",
+        "admin_only": True,
+    },
+    "/kick": {
+        "description": "Kick thành viên",
+        "usage": "/kick @user <reason>",
+        "admin_only": True,
+    },
+    "/promote": {
+        "description": "Thăng admin",
+        "usage": "/promote @user",
+        "admin_only": True,
+    },
+    "/demote": {
+        "description": "Xoá quyền admin",
+        "usage": "/demote @user",
+        "admin_only": True,
+    },
+    "/info": {
+        "description": "Thông tin nhóm",
+        "usage": "/info",
+        "admin_only": False,
+    },
+}
 
 # ---------------------------------------------------------------------------
 # Zalo API Client (thin HTTP wrapper)
@@ -132,6 +226,264 @@ class _ZaloClient:
 
 
 # ---------------------------------------------------------------------------
+# Moderation & Group Management Classes
+# ---------------------------------------------------------------------------
+
+
+class _AntiSpam:
+    """Zero-token anti-spam detection."""
+
+    def __init__(self) -> None:
+        self._store: Dict[str, List[float]] = {}
+
+    def check(self, group_id: str, user_id: str, text: str) -> Dict[str, Any]:
+        now = time.time()
+        key = f"{group_id}:{user_id}"
+        if key not in self._store:
+            self._store[key] = []
+        self._store[key] = [t for t in self._store[key] if now - t < 60]
+        self._store[key].append(now)
+        if len(self._store[key]) > ANTI_SPAM_MAX_PER_MINUTE:
+            return {"spam": True, "reason": "rate_limit_exceeded"}
+        text_lower = text.lower()
+        for pattern in ["bit.ly", "tinyurl.com", "t.me/", "tiktok.com",
+                        "facebook.com/", "instagram.com/", "twitter.com/"]:
+            if pattern in text_lower:
+                return {"spam": True, "reason": "suspicious_link"}
+        return {"spam": False, "reason": ""}
+
+
+class _WarnSystem:
+    """Zero-token warn tracking."""
+
+    def __init__(self) -> None:
+        self._store: Dict[str, List[Dict[str, Any]]] = {}
+
+    def warn(self, group_id: str, user_id: str, reason: str = "") -> Dict[str, Any]:
+        key = f"{group_id}:{user_id}"
+        if key not in self._store:
+            self._store[key] = []
+        now = time.time()
+        self._store[key] = [
+            w for w in self._store[key]
+            if now - w["timestamp"] < WARN_EXPIRY_SECONDS
+        ]
+        entry = {"timestamp": now, "reason": reason[:200],
+                 "count": len(self._store[key]) + 1}
+        self._store[key].append(entry)
+        if entry["count"] >= WARN_MAX_WARNINGS:
+            return {"ok": True, "action": "max_warnings_reached",
+                    "warning": entry,
+                    "message": f"⚠️ {user_id} đã đạt {WARN_MAX_WARNINGS} cảnh báo."}
+        return {"ok": True, "action": "warned", "warning": entry}
+
+    def get_warnings(self, group_id: str, user_id: str) -> List[Dict[str, Any]]:
+        return self._store.get(f"{group_id}:{user_id}", [])
+
+    def clear_warnings(self, group_id: str, user_id: str) -> Dict[str, Any]:
+        self._store.pop(f"{group_id}:{user_id}", None)
+        return {"ok": True, "action": "cleared"}
+
+
+class _GroupManager:
+    """Group management via Zalo Bot API."""
+
+    def __init__(self, client: Any) -> None:
+        self._client = client
+
+    async def create_group(self, name: str, description: str = "",
+                           join_type: str = "anyone",
+                           admin_ids: Optional[List[str]] = None) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {"name": name[:100], "description": description[:500],
+                                   "join_type": join_type}
+        if admin_ids:
+            payload["admin_ids"] = admin_ids[:20]
+        return await self._client._post("createGroup", payload)
+
+    async def kick_member(self, group_id: str, user_id: str,
+                          reason: str = "") -> Dict[str, Any]:
+        payload: Dict[str, Any] = {"group_id": group_id, "user_id": user_id}
+        if reason:
+            payload["reason"] = reason[:200]
+        return await self._client._post("kickGroupMember", payload)
+
+    async def promote_admin(self, group_id: str, user_id: str) -> Dict[str, Any]:
+        return await self._client._post("promoteGroupAdmin",
+                                        {"group_id": group_id, "user_id": user_id})
+
+    async def demote_admin(self, group_id: str, user_id: str) -> Dict[str, Any]:
+        return await self._client._post("demoteGroupAdmin",
+                                        {"group_id": group_id, "user_id": user_id})
+
+    async def invite_member(self, group_id: str, user_ids: List[str]) -> Dict[str, Any]:
+        return await self._client._post("inviteGroupMember",
+                                        {"group_id": group_id, "user_ids": user_ids[:50]})
+
+    async def get_group_info(self, group_id: str) -> Dict[str, Any]:
+        return await self._client._post("getGroupInfo", {"group_id": group_id})
+
+    async def list_members(self, group_id: str, limit: int = 50) -> Dict[str, Any]:
+        return await self._client._post("listGroupMembers",
+                                        {"group_id": group_id, "limit": limit})
+
+    async def set_announcement(self, group_id: str, text: str) -> Dict[str, Any]:
+        return await self._client._post("setGroupAnnouncement",
+                                        {"group_id": group_id, "text": text[:500]})
+
+    async def create_poll(self, group_id: str, question: str,
+                          options: List[str], expiry: int = 86400,
+                          allow_multiple: bool = False) -> Dict[str, Any]:
+        if len(options) < 2 or len(options) > 10:
+            return {"ok": False, "error": "Poll requires 2-10 options"}
+        payload = {"group_id": group_id, "question": question[:200],
+                   "options": [o[:100] for o in options],
+                   "expiry": expiry, "allow_multiple": allow_multiple}
+        return await self._client._post("createPoll", payload)
+
+    async def pin_message(self, group_id: str, message_id: str) -> Dict[str, Any]:
+        return await self._client._post("pinGroupMessage",
+                                        {"group_id": group_id, "message_id": message_id})
+
+    async def unpin_message(self, group_id: str, message_id: str) -> Dict[str, Any]:
+        return await self._client._post("unpinGroupMessage",
+                                        {"group_id": group_id, "message_id": message_id})
+
+
+class _ChatHistorySync:
+    """Synchronizes Zalo chat history for agent access."""
+
+    def __init__(self) -> None:
+        self._dir = Path(HISTORY_DIR)
+        self._dir.mkdir(parents=True, exist_ok=True)
+        self._buffer: Dict[str, List[Dict[str, Any]]] = {}
+
+    def save_message(self, group_id: str, message: Dict[str, Any]) -> None:
+        if group_id not in self._buffer:
+            self._buffer[group_id] = []
+        entry = {
+            "message_id": message.get("message_id", ""),
+            "from_id": message.get("from_id", ""),
+            "from_name": message.get("from_name", ""),
+            "text": message.get("text", ""),
+            "timestamp": message.get("timestamp", time.time()),
+            "type": message.get("type", "text"),
+        }
+        self._buffer[group_id].append(entry)
+        if len(self._buffer[group_id]) > 500:
+            self.flush(group_id)
+
+    def flush(self, group_id: str) -> int:
+        if group_id not in self._buffer:
+            return 0
+        filepath = self._dir / f"{group_id}.jsonl"
+        messages = self._buffer.pop(group_id, [])
+        with open(filepath, "a", encoding="utf-8") as f:
+            for msg in messages:
+                f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+        return len(messages)
+
+    def get_recent(self, group_id: str, limit: int = 50) -> List[Dict[str, Any]]:
+        filepath = self._dir / f"{group_id}.jsonl"
+        if not filepath.exists():
+            return []
+        messages = []
+        with open(filepath, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    messages.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+        return messages[-limit:][::-1]
+
+    def search(self, group_id: str, query: str, limit: int = 20) -> List[Dict[str, Any]]:
+        messages = self.get_recent(group_id, 10000)
+        q = query.lower()
+        return [m for m in messages if q in m.get("text", "").lower()][:limit]
+
+
+class _CRMContacts:
+    """CRM contact management for Zalo groups."""
+
+    def __init__(self) -> None:
+        self._dir = Path(CRM_DATA_DIR)
+        self._dir.mkdir(parents=True, exist_ok=True)
+
+    def _filepath(self, group_id: str) -> Path:
+        return self._dir / f"{group_id}_contacts.json"
+
+    def _load(self, filepath: Path) -> Dict[str, Any]:
+        if not filepath.exists():
+            return {}
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return {}
+
+    def _save(self, filepath: Path, contacts: Dict[str, Any]) -> None:
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(contacts, f, ensure_ascii=False, indent=2)
+
+    def add_contact(self, group_id: str, user_id: str, phone: str = "",
+                    name: str = "", labels: Optional[List[str]] = None) -> Dict[str, Any]:
+        filepath = self._filepath(group_id)
+        contacts = self._load(filepath)
+        contact = contacts.get(user_id, {})
+        contact.update({"user_id": user_id, "phone": phone, "name": name,
+                        "labels": labels or [], "updated_at": time.time()})
+        contacts[user_id] = contact
+        self._save(filepath, contacts)
+        return {"ok": True, "contact": contact}
+
+    def get_contact(self, group_id: str, user_id: str) -> Optional[Dict[str, Any]]:
+        return self._load(self._filepath(group_id)).get(user_id)
+
+    def list_contacts(self, group_id: str, label: str = "") -> List[Dict[str, Any]]:
+        contacts = list(self._load(self._filepath(group_id)).values())
+        if label:
+            contacts = [c for c in contacts if label in c.get("labels", [])]
+        return sorted(contacts, key=lambda c: c.get("updated_at", 0), reverse=True)
+
+    def import_csv(self, group_id: str, csv_path: str) -> Dict[str, Any]:
+        import csv as _csv
+        filepath = self._filepath(group_id)
+        contacts = self._load(filepath)
+        imported = 0
+        with open(csv_path, "r", encoding="utf-8") as f:
+            for row in _csv.DictReader(f):
+                uid = row.get("user_id", "")
+                if not uid:
+                    continue
+                c = contacts.get(uid, {})
+                c.update({"user_id": uid, "phone": row.get("phone", ""),
+                          "name": row.get("name", ""),
+                          "labels": [l.strip() for l in row.get("labels", "").split(",") if l.strip()],
+                          "updated_at": time.time()})
+                contacts[uid] = c
+                imported += 1
+        self._save(filepath, contacts)
+        return {"ok": True, "imported": imported}
+
+    def export_csv(self, group_id: str, csv_path: str) -> Dict[str, Any]:
+        import csv as _csv
+        contacts = self._load(self._filepath(group_id))
+        exported = 0
+        with open(csv_path, "w", encoding="utf-8", newline="") as f:
+            w = _csv.DictWriter(f, fieldnames=["user_id", "phone", "name", "labels"])
+            w.writeheader()
+            for c in contacts.values():
+                w.writerow({"user_id": c.get("user_id", ""),
+                            "phone": c.get("phone", ""),
+                            "name": c.get("name", ""),
+                            "labels": ",".join(c.get("labels", []))})
+                exported += 1
+        return {"ok": True, "exported": exported}
+
+
+# ---------------------------------------------------------------------------
 # Zalo Adapter
 # ---------------------------------------------------------------------------
 
@@ -183,6 +535,13 @@ class ZaloAdapter(BasePlatformAdapter):
         self._bot_id: str = ""
         self._bot_name: str = ""
         self._pending_approvals: Dict[str, dict] = {}  # chat_id -> approval info
+
+        # Moderation & group management instances
+        self._anti_spam = _AntiSpam()
+        self._warn_system = _WarnSystem()
+        self._group_manager = _GroupManager(self._client)
+        self._history_sync = _ChatHistorySync()
+        self._crm = _CRMContacts()
 
     def _redact_token(self, token: str) -> str:
         """Redact bot token for logging (show first 4 chars + last 4)."""
@@ -492,6 +851,21 @@ class ZaloAdapter(BasePlatformAdapter):
             logger.debug("Zalo: ignoring message from unauthorized user %s", user_id)
             return
 
+        # ── Slash command handling ──────────────────────────────
+        slash = parse_slash_command(text)
+        if slash and chat_type == "GROUP":
+            await self._handle_slash_command(
+                slash, chat_id, user_id, user_name, message_type, media_url, chat_type
+            )
+            return
+
+        # ── Anti-spam check for group messages ──────────────────
+        if is_group:
+            spam = self._anti_spam.check(chat_id, user_id, text)
+            if spam["spam"]:
+                logger.debug("Zalo: spam blocked for %s in group %s", user_id, chat_id)
+                return
+
         # Dispatch
         await self._dispatch_message(
             text=text,
@@ -500,8 +874,163 @@ class ZaloAdapter(BasePlatformAdapter):
             user_name=user_name,
             message_type=message_type,
             media_url=media_url,
-            chat_type="dm",
+            chat_type=chat_type,
         )
+
+    async def _handle_slash_command(
+        self,
+        slash: Dict[str, Any],
+        chat_id: str,
+        user_id: str,
+        user_name: str,
+        message_type: MessageType,
+        media_url: Optional[str],
+        chat_type: str = "dm",
+    ) -> None:
+        """Handle a slash command in a group chat."""
+        cmd = slash["command"]
+        args = slash["args"]
+        spec = slash["spec"]
+
+        # Admin-only check
+        # For group commands, verify user is admin/owner in the group
+        if spec["admin_only"] and chat_type == "GROUP":
+            group_info = await self._group_manager.get_group_info(chat_id)
+            members = group_info.get("result", {}).get("members", [])
+            user_role = "member"
+            for m in members:
+                if str(m.get("user_id")) == str(user_id):
+                    user_role = m.get("role", "member")
+                    break
+            if user_role not in ("owner", "admin"):
+                await self._send_text(chat_id, "❌ Bạn không có quyền thực hiện lệnh này.")
+                return
+        elif spec["admin_only"] and not self._is_user_authorized(user_id):
+            await self._send_text(chat_id, "❌ Bạn không có quyền thực hiện lệnh này.")
+            return
+
+        try:
+            if cmd == "/menu":
+                await self._send_text(chat_id, format_menu())
+            elif cmd == "/rules":
+                await self._send_text(chat_id, format_rules())
+            elif cmd == "/huong-dan":
+                await self._send_text(chat_id, format_help())
+            elif cmd == "/info":
+                info = await self._group_manager.get_group_info(chat_id)
+                result = info.get("result", {})
+                name = result.get("name", chat_id)
+                members = result.get("member_count", 0)
+                await self._send_text(
+                    chat_id,
+                    f"ℹ️ **{name}**\n👥 Thành viên: {members}\n📝 Nhóm ID: {chat_id}",
+                )
+            elif cmd == "/warn":
+                target = args.strip().split(None, 1)
+                if not target:
+                    await self._send_text(chat_id, "⚠️ Dùng: `/warn @user <lí do>`")
+                    return
+                reason = target[1] if len(target) > 1 else "Chưa rõ lí do"
+                result = self._warn_system.warn(chat_id, target[0].lstrip("@"), reason)
+                msg = result.get("message", f"⚠️ Đã cảnh báo {target[0]}")
+                await self._send_text(chat_id, msg)
+            elif cmd == "/unwarn":
+                target = args.strip().lstrip("@")
+                self._warn_system.clear_warnings(chat_id, target)
+                await self._send_text(chat_id, f"✅ Đã xóa cảnh báo cho {target}")
+            elif cmd == "/report":
+                target = args.strip().split(None, 1)
+                if not target:
+                    await self._send_text(chat_id, "⚠️ Dùng: `/report @user <lí do>`")
+                    return
+                reason = target[1] if len(target) > 1 else "Chưa rõ lí do"
+                result = self._warn_system.warn(chat_id, target[0].lstrip("@"), f"REPORT: {reason}")
+                await self._send_text(
+                    chat_id,
+                    f"📋 Đã báo cáo {target[0]}: {reason}",
+                )
+            elif cmd == "/kick":
+                target = args.strip().split(None, 1)
+                if not target:
+                    await self._send_text(chat_id, "⚠️ Dùng: `/kick @user <lí do>`")
+                    return
+                reason = target[1] if len(target) > 1 else ""
+                result = await self._group_manager.kick_member(chat_id, target[0].lstrip("@"), reason)
+                if result.get("ok"):
+                    await self._send_text(chat_id, f"✅ Đã kick {target[0]}")
+                else:
+                    await self._send_text(chat_id, f"❌ Lỗi: {result.get('error', 'Unknown')}")
+            elif cmd == "/promote":
+                target = args.strip().lstrip("@")
+                result = await self._group_manager.promote_admin(chat_id, target)
+                if result.get("ok"):
+                    await self._send_text(chat_id, f"✅ {target} đã được thăng admin")
+                else:
+                    await self._send_text(chat_id, f"❌ Lỗi: {result.get('error', 'Unknown')}")
+            elif cmd == "/demote":
+                target = args.strip().lstrip("@")
+                result = await self._group_manager.demote_admin(chat_id, target)
+                if result.get("ok"):
+                    await self._send_text(chat_id, f"✅ {target} đã bị xoá quyền admin")
+                else:
+                    await self._send_text(chat_id, f"❌ Lỗi: {result.get('error', 'Unknown')}")
+            elif cmd == "/invite":
+                targets = [u.strip().lstrip("@") for u in args.split(",") if u.strip()]
+                if not targets:
+                    await self._send_text(chat_id, "⚠️ Dùng: `/invite @user1, @user2`")
+                    return
+                result = await self._group_manager.invite_member(chat_id, targets)
+                if result.get("ok"):
+                    await self._send_text(chat_id, f"✅ Đã mời {len(targets)} thành viên")
+                else:
+                    await self._send_text(chat_id, f"❌ Lỗi: {result.get('error', 'Unknown')}")
+            elif cmd == "/poll":
+                parts = args.split("|")
+                if len(parts) < 2:
+                    await self._send_text(chat_id, "⚠️ Dùng: `/poll <câu hỏi> | lựa_chọn_1, lựa_chọn_2, ...`")
+                    return
+                question = parts[0].strip()
+                options = [o.strip() for o in parts[1].split(",") if o.strip()]
+                result = await self._group_manager.create_poll(chat_id, question, options)
+                if result.get("ok"):
+                    await self._send_text(chat_id, f"📊 Poll đã tạo: {question}")
+                else:
+                    await self._send_text(chat_id, f"❌ Lỗi: {result.get('error', 'Unknown')}")
+            elif cmd == "/pin":
+                msg_id = args.strip()
+                if not msg_id:
+                    await self._send_text(chat_id, "⚠️ Dùng: `/pin <message_id>`")
+                    return
+                result = await self._group_manager.pin_message(chat_id, msg_id)
+                if result.get("ok"):
+                    await self._send_text(chat_id, "📌 Đã ghim tin nhắn")
+                else:
+                    await self._send_text(chat_id, f"❌ Lỗi: {result.get('error', 'Unknown')}")
+            elif cmd == "/unpin":
+                msg_id = args.strip()
+                if not msg_id:
+                    await self._send_text(chat_id, "⚠️ Dùng: `/unpin <message_id>`")
+                    return
+                result = await self._group_manager.unpin_message(chat_id, msg_id)
+                if result.get("ok"):
+                    await self._send_text(chat_id, "📌 Đã bỏ ghim")
+                else:
+                    await self._send_text(chat_id, f"❌ Lỗi: {result.get('error', 'Unknown')}")
+            elif cmd == "/noi-quy":
+                announcement = args.strip()
+                if not announcement:
+                    await self._send_text(chat_id, "⚠️ Dùng: `/noi-quy <nội dung>`")
+                    return
+                result = await self._group_manager.set_announcement(chat_id, announcement)
+                if result.get("ok"):
+                    await self._send_text(chat_id, "📢 Đã đăng thông báo nhóm")
+                else:
+                    await self._send_text(chat_id, f"❌ Lỗi: {result.get('error', 'Unknown')}")
+            else:
+                await self._send_text(chat_id, f"❓ Không biết lệnh `{cmd}`. Dùng `/menu` để xem danh sách.")
+        except Exception as e:
+            logger.error("Zalo: slash command error: %s", e)
+            await self._send_text(chat_id, f"❌ Lỗi xử lý lệnh: {str(e)[:100]}")
 
     async def _send_pairing_code(self, chat_id: str, code: str, user_name: str) -> None:
         """Send a pairing approval code to a new user."""
@@ -780,6 +1309,59 @@ async def _standalone_send(
         return {"error": f"Zalo standalone send failed: {e}"}
     finally:
         await client.close()
+
+
+def parse_slash_command(text: str) -> Optional[Dict[str, Any]]:
+    """Parse a slash command from message text. Returns command dict or None."""
+    text = text.strip()
+    if not text.startswith("/"):
+        return None
+    parts = text.split(None, 1)
+    command = parts[0].lower()
+    args = parts[1] if len(parts) > 1 else ""
+    if command not in SLASH_COMMANDS:
+        return None
+    return {"command": command, "args": args.strip(), "spec": SLASH_COMMANDS[command]}
+
+
+def format_menu() -> str:
+    """Format the command menu for display."""
+    lines = ["📋 **Menu lệnh Zalo Bot:**\n"]
+    for cmd, spec in SLASH_COMMANDS.items():
+        visibility = "🔒 Admin" if spec["admin_only"] else "🌐 Mọi người"
+        lines.append(f"  `{spec['usage']}` — {spec['description']} ({visibility})")
+    return "\n".join(lines)
+
+
+def format_rules() -> str:
+    """Format default group rules."""
+    return (
+        "📜 **Quy tắc nhóm:**\n\n"
+        "1. 🗣️ Lịch sự, không spam hay xúc phạm\n"
+        "2. 🚫 Không chia sẻ link đáng ngờ\n"
+        "3. 📌 Tuân thủ nội quy đã được thiết lập\n"
+        "4. 💬 Sử dụng `/menu` để xem danh sách lệnh\n"
+        "5. 🛡️ Vi phạm sẽ bị cảnh báo, 3 lần → xử lý\n\n"
+        "_Quy tắc này được bot Zalo tự động thực thi._"
+    )
+
+
+def format_help() -> str:
+    """Format help text."""
+    return (
+        "🤖 **Hướng dẫn sử dụng Zalo Bot:**\n\n"
+        "Bot hỗ trợ các lệnh slash để quản lý nhóm:\n"
+        "• `/menu` — Xem menu lệnh\n"
+        "• `/rules` — Xem quy tắc nhóm\n"
+        "• `/huong-dan` — Hướng dẫn chi tiết\n\n"
+        "Admin còn có thêm:\n"
+        "• `/warn @user <lí do>` — Cảnh báo\n"
+        "• `/kick @user <lí do>` — Kick\n"
+        "• `/promote @user` — Thăng admin\n"
+        "• `/poll <câu hỏi> | opt1, opt2` — Tạo poll\n"
+        "• `/pin <msg_id>` — Ghim tin nhắn\n\n"
+        "Nhắn trực tiếp cho bot để bắt đầu cuộc trò chuyện."
+    )
 
 
 def register(ctx):

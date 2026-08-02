@@ -4,7 +4,7 @@ build-backend = "setuptools.backends._legacy:_Backend"
 
 [project]
 name = "hermes-plugin-zalo"
-version = "1.0.0"
+version = "2.0.0"
 description = "Zalo Bot Platform gateway adapter for Hermes Agent"
 readme = "README.md"
 license = {text = "MIT"}

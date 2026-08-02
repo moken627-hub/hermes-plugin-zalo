@@ -29,13 +29,20 @@ A **platform plugin** for [Hermes Agent](https://github.com/NousResearch/hermes-
 | 📬 Cron delivery (`deliver=zalo`) | ✅ |
 | ⚙️ Interactive setup wizard (`hermes gateway setup`) | ✅ |
 | 📦 Zero extra dependencies (uses httpx, already a Hermes dep) | ✅ |
+| 👥 Group management (create, kick, admin, poll, pin, invite) | ✅ v2 |
+| 📝 Slash commands (/menu, /warn, /kick, /promote, /poll, /pin...) | ✅ v2 |
+| 🛡️ Zero-token anti-spam + warn system | ✅ v2 |
+| 📜 Chat history sync (JSONL, search) | ✅ v2 |
+| 👥 CRM contacts (import/export CSV, search by phone) | ✅ v2 |
+| 📊 Group info, member list, announcements | ✅ v2 |
 
 ### 🗺️ Roadmap
 
-- [ ] Group chat support (when Zalo Bot Platform enables it)
 - [ ] Sticker sending/receiving
 - [ ] Image/file upload (multipart)
 - [ ] Voice message support
+- [ ] Rich text formatting (bold/italic/color)
+- [ ] Zalo labels sync
 
 ---
 
@@ -137,8 +144,11 @@ Then configure your webhook URL in the Zalo Bot Platform dashboard.
 hermes-plugin-zalo/
 ├── zalo/
 │   ├── __init__.py          # Plugin entry point (exports register)
-│   ├── adapter.py           # Full Zalo adapter implementation
-│   └── plugin.yaml          # Plugin metadata & config schema
+│   ├── adapter.py           # Full Zalo adapter + moderation + group mgmt
+│   ├── plugin.yaml          # Plugin metadata & config schema
+│   ├── group_manager.py     # Group management (create/kick/admin/poll/pin)
+│   ├── moderation.py        # Anti-spam, warn system, CRM, history sync
+│   └── ...
 ├── examples/
 │   └── config.yaml          # Example configuration
 ├── .github/
@@ -188,6 +198,17 @@ python -c "from gateway.platforms.base import BasePlatformAdapter; print('OK')"
 ---
 
 ## 📝 Changelog
+
+### v2.0.0 (2026-08-02)
+
+- 🎉 **Major release** — Enterprise-grade Zalo moderation and group management
+- 👥 Group management: create, kick, promote/demote admin, invite, poll, pin
+- 📝 Slash commands: /menu, /rules, /warn, /kick, /promote, /poll, /pin, /noi-quy, /info...
+- 🛡️ Zero-token anti-spam: rate limiting + suspicious link detection
+- ⚠️ Warn system: 3-strike moderation with expiry
+- 📜 Chat history sync: JSONL-based, searchable, flush-to-disk
+- 👥 CRM contacts: add/search/list, CSV import/export, per-group labels
+- 📊 Group info, member list, announcements
 
 ### v1.0.0 (2026-05-10)
 
