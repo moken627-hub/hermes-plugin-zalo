@@ -882,6 +882,17 @@ class ZaloAdapter(BasePlatformAdapter):
         chat_type = chat_info.get("chat_type", "PRIVATE")
         raw_text = (message.get("text") or message.get("caption") or "").strip()
 
+        # ── Group member joined event → welcome message ────────────────
+        if "join" in event_name.lower() or "member_joined" in event_name.lower():
+            settings = self._group_settings.get(chat_id)
+            if settings.get("welcome", False):
+                welcome_text = settings.get("welcome_text", "") or (
+                    f"Chào mừng {user_name} đến với nhóm! 🎉\n"
+                    "Gõ /menu để xem danh sách lệnh."
+                )
+                await self._send_text(chat_id, welcome_text)
+            return
+
         # Ignore bot's own messages
         if from_info.get("is_bot", False):
             return
@@ -905,19 +916,62 @@ class ZaloAdapter(BasePlatformAdapter):
         # ── Group message handling ──────────────────────────────────────
         is_group = chat_type == "GROUP"
         if is_group:
-            # Check if bot is mentioned: @mention or reply to bot
+            settings = self._group_settings.get(chat_id)
+
+            # 1. Muted check — group muted → ignore all messages
+            if settings.get("muted", False):
+                logger.debug("Zalo: group %s muted, ignoring message", chat_id)
+                return
+
+            # 2. Slash commands work regardless of silent mode (admin ops)
+            slash = parse_slash_command(text)
+            if slash:
+                await self._handle_slash_command(
+                    slash, chat_id, user_id, user_name, message_type, media_url, chat_type
+                )
+                return
+
+            # 3. Anti-spam check (BEFORE dispatch)
+            spam = self._anti_spam.check(chat_id, user_id, text)
+            if spam["spam"]:
+                logger.debug("Zalo: spam blocked for %s in group %s", user_id, chat_id)
+                return
+
+            # 4. Name triggers — auto-reply when configured name is mentioned
+            triggers = settings.get("name_triggers", [])
+            for t in triggers:
+                tname = str(t.get("name", "")).lower()
+                if tname and tname in text.lower():
+                    await self._send_text(chat_id, str(t.get("reply", "")))
+                    return
+
+            # 5. Follow/tracking — save to chat history when enabled
+            if settings.get("follow", False):
+                self._history_sync.save_message(chat_id, {
+                    "message_id": str(message.get("message_id", "")),
+                    "from_id": user_id,
+                    "from_name": user_name,
+                    "text": text,
+                    "timestamp": time.time(),
+                    "type": "text",
+                })
+
+            # 6. Check if bot is mentioned: @mention or reply to bot
             mentioned = False
 
-            # 1. Check @mention (display_name)
+            # 6a. Check @mention (display_name)
             if self._bot_name and self._bot_name in text:
                 mentioned = True
 
-            # 2. Check reply
+            # 6b. Check reply
             if message.get("reply_to"):
                 reply_to = message["reply_to"]
                 if isinstance(reply_to, dict) and reply_to.get("from", {}).get("id") == self._bot_id:
                     mentioned = True
 
+            # 6c. Silent mode: only reply when mentioned
+            #     (default behavior = silent ON; silent OFF still requires mention
+            #      to avoid burning tokens on every group message)
             if not mentioned:
                 logger.debug("Zalo: ignoring group message — bot not mentioned")
                 return
@@ -987,8 +1041,9 @@ class ZaloAdapter(BasePlatformAdapter):
             return
 
         # ── Slash command handling ──────────────────────────────
+        # Works in both group and DM (owner/admin control from DM)
         slash = parse_slash_command(text)
-        if slash and chat_type == "GROUP":
+        if slash:
             await self._handle_slash_command(
                 slash, chat_id, user_id, user_name, message_type, media_url, chat_type
             )
@@ -1029,20 +1084,30 @@ class ZaloAdapter(BasePlatformAdapter):
 
         # Admin-only check
         # For group commands, verify user is admin/owner in the group
-        if spec["admin_only"] and chat_type == "GROUP":
-            group_info = await self._group_manager.get_group_info(chat_id)
-            members = group_info.get("result", {}).get("members", [])
-            user_role = "member"
-            for m in members:
-                if str(m.get("user_id")) == str(user_id):
-                    user_role = m.get("role", "member")
-                    break
-            if user_role not in ("owner", "admin"):
-                await self._send_text(chat_id, "❌ Bạn không có quyền thực hiện lệnh này.")
-                return
-        elif spec["admin_only"] and not self._is_user_authorized(user_id):
-            await self._send_text(chat_id, "❌ Bạn không có quyền thực hiện lệnh này.")
-            return
+        if spec["admin_only"]:
+            if chat_type == "GROUP":
+                # Group admin/owner check via group member roles
+                try:
+                    group_info = await self._group_manager.get_group_info(chat_id)
+                    members = group_info.get("result", {}).get("members", [])
+                    user_role = "member"
+                    for m in members:
+                        if str(m.get("user_id")) == str(user_id):
+                            user_role = m.get("role", "member")
+                            break
+                    if user_role not in ("owner", "admin"):
+                        await self._send_text(chat_id, "❌ Bạn không có quyền thực hiện lệnh này.")
+                        return
+                except Exception as e:
+                    logger.warning("Zalo: group admin check failed (%s) — falling back to allowlist", e)
+                    if not self._is_user_authorized(user_id):
+                        await self._send_text(chat_id, "❌ Bạn không có quyền thực hiện lệnh này.")
+                        return
+            else:
+                # DM: admin-only commands require allowlist authorization
+                if not self._is_user_authorized(user_id):
+                    await self._send_text(chat_id, "❌ Bạn không có quyền thực hiện lệnh này.")
+                    return
 
         try:
             if cmd == "/menu":
