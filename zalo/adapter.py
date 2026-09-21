@@ -1370,7 +1370,7 @@ class ZaloAdapter(BasePlatformAdapter):
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
-        # Strip markdown that Zalo doesn't support (keep bold/italic)
+        # Strip ALL markdown to plain text (Zalo does not reliably render markdown)
         content = self._strip_markdown(content)
 
         # Split into chunks if too long
@@ -1423,18 +1423,48 @@ class ZaloAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _strip_markdown(text: str) -> str:
-        """Strip unsupported markdown, keep bold/italic.
+        """Strip markdown formatting to plain text for Zalo.
 
-        Zalo Bot API supports some markdown-like formatting.
-        We strip complex formatting and keep the essentials.
+        Zalo does NOT reliably render markdown, so keep chat replies plain:
+        remove bold, italic, headings, lists, inline code, tables, blockquotes,
+        links and images so no raw ``*``, ``#``, ``-``, ``|``, ``>``, `` ` `` or
+        ``~`` leaks to the customer.
         """
         import re
-        # Images: ![text](url) → url
+        # Images: ![alt](url) -> url
         text = re.sub(r"!\[([^\]]*)\]\(([^)]+)\)", r"\2", text)
-        # Links: [text](url) → text (url)
+        # Links: [text](url) -> text (url)
         text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1 (\2)", text)
-        # Preserve **bold** and *italic*
-        return text
+        # Inline code: `code` -> code
+        text = re.sub(r"`([^`]*)`", r"\1", text)
+        # Bold: **text** / __text__ -> text
+        text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
+        text = re.sub(r"__(.+?)__", r"\1", text)
+        # Italic: *text* / _text_ -> text
+        text = re.sub(r"(?<![\w*])\*([^*\n]+?)\*(?![\w*])", r"\1", text)
+        text = re.sub(r"(?<![\w_])\_([^_\n]+?)\_(?![\w_])", r"\1", text)
+        # Strikethrough: ~~text~~ -> text
+        text = re.sub(r"~~(.+?)~~", r"\1", text)
+        # Headings: strip leading #s, keep the text
+        text = re.sub(r"^#{1,6}[ \t]*", "", text, flags=re.MULTILINE)
+        # Blockquote: strip leading >
+        text = re.sub(r"^[ \t]*>[ \t]?", "", text, flags=re.MULTILINE)
+        # Ordered/unordered list markers: strip, keep the text
+        text = re.sub(r"^[ \t]*(?:[-*+][ \t]+|\d+[.)][ \t]+)", "", text, flags=re.MULTILINE)
+        # Table separator rows: drop the whole line
+        text = re.sub(r"^[ \t]*\|[\s:|-]+\|[ \t]*$", "", text, flags=re.MULTILINE)
+        text = re.sub(r"^[ \t]*-{3,}[ \t]*$", "", text, flags=re.MULTILINE)
+        # Table data rows -> plain per-line, cells joined with an em-dash
+        def _fmt_table(m):
+            inner = m.group(0).strip().strip("|")
+            cells = [c.strip() for c in inner.split("|") if c.strip()]
+            return " — ".join(cells)
+        text = re.sub(r"^[ \t]*\|.*\|[ \t]*$", _fmt_table, text, flags=re.MULTILINE)
+        # Remove any stray emphasis markers left behind
+        text = re.sub(r"[*~]", "", text)
+        # Collapse 3+ blank lines to a single blank line, trim edges
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -1647,7 +1677,7 @@ def register(ctx):
         allow_update_command=True,
         platform_hint=(
             "You are chatting via Zalo. Zalo supports limited formatting "
-            "— **bold** and *italic* work, but complex markdown is stripped. "
+            "— replies are plain text: markdown (bold, headings, tables) is stripped automatically. "
             "Messages are limited to 2000 characters per message "
             "(long messages are automatically split). "
             "Keep responses concise and conversational. "
