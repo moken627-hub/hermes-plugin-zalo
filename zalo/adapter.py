@@ -636,7 +636,7 @@ class ZaloAdapter(BasePlatformAdapter):
         extra = getattr(config, "extra", {}) or {}
 
         # Bot token (env overrides config.yaml)
-        self.bot_token = os.getenv("ZALO_BOT_TOKEN") or extra.get("bot_token", "")
+        self.bot_token = _resolve_zalo_secret("ZALO_BOT_TOKEN", extra.get("bot_token", ""))
         self.bot_token = self.bot_token.strip()
         self._redacted_token = self._redact_token(self.bot_token)
 
@@ -668,6 +668,7 @@ class ZaloAdapter(BasePlatformAdapter):
         self._bot_info: Optional[dict] = None
         self._bot_id: str = ""
         self._bot_name: str = ""
+        self._bot_display_name: str = ""
         self._pending_approvals: Dict[str, dict] = {}  # chat_id -> approval info
 
         # Moderation & group management instances
@@ -690,7 +691,7 @@ class ZaloAdapter(BasePlatformAdapter):
 
     # ── Connection lifecycle ──────────────────────────────────────────────
 
-    async def connect(self) -> bool:
+    async def connect(self, is_reconnect: bool = False) -> bool:
         """Connect to Zalo Bot API: verify token and start polling/webhook."""
         if not self.bot_token:
             logger.error("Zalo: bot_token must be configured")
@@ -717,6 +718,7 @@ class ZaloAdapter(BasePlatformAdapter):
             self._bot_info = me.get("result", {})
             self._bot_id = str(self._bot_info.get("id", ""))
             self._bot_name = self._bot_info.get("account_name", "")
+            self._bot_display_name = self._bot_info.get("display_name", "")
             logger.info(
                 "Zalo: verified bot '%s' (id=%s, type=%s)",
                 self._bot_info.get("account_name", "?"),
@@ -730,7 +732,10 @@ class ZaloAdapter(BasePlatformAdapter):
 
         # Start receiving messages (polling or webhook)
         if self.webhook_url and self.webhook_secret:
-            await self._start_webhook()
+            # Run webhook listener as a background task so is_connected can be
+            # marked before its keep-alive loop is evaluated (fix: while loop
+            # on is_connected previously saw False -> cleanup closed listener).
+            self._webhook_runner = asyncio.create_task(self._start_webhook())
         else:
             await self._start_polling()
 
@@ -860,9 +865,9 @@ class ZaloAdapter(BasePlatformAdapter):
         await site.start()
         logger.info("Zalo: webhook listening on port %d", self.webhook_port)
 
-        # Keep the task alive
+        # Keep the task alive (runs as background task; cancelled on disconnect)
         try:
-            while self.is_connected:
+            while True:
                 await asyncio.sleep(3600)
         except asyncio.CancelledError:
             raise
@@ -959,8 +964,9 @@ class ZaloAdapter(BasePlatformAdapter):
             # 6. Check if bot is mentioned: @mention or reply to bot
             mentioned = False
 
-            # 6a. Check @mention (display_name)
-            if self._bot_name and self._bot_name in text:
+            # 6a. Check @mention (account_name OR display_name)
+            if (self._bot_name and self._bot_name in text) or \
+               (self._bot_display_name and self._bot_display_name in text):
                 mentioned = True
 
             # 6b. Check reply
@@ -979,6 +985,8 @@ class ZaloAdapter(BasePlatformAdapter):
             # Strip bot mention from text
             if self._bot_name:
                 text = text.replace(f"@{self._bot_name}", "").replace(f"{self._bot_name}", "").strip()
+            if self._bot_display_name:
+                text = text.replace(f"@{self._bot_display_name}", "").replace(f"{self._bot_display_name}", "").strip()
 
             # Auth check for group (check the user who sent it)
             if not self._is_user_authorized(user_id):
@@ -1370,7 +1378,7 @@ class ZaloAdapter(BasePlatformAdapter):
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
-        # Strip ALL markdown to plain text (Zalo does not reliably render markdown)
+        # Strip markdown that Zalo doesn't support (keep bold/italic)
         content = self._strip_markdown(content)
 
         # Split into chunks if too long
@@ -1472,23 +1480,41 @@ class ZaloAdapter(BasePlatformAdapter):
 # ---------------------------------------------------------------------------
 
 
+
+def _resolve_zalo_secret(name: str, default: str = "") -> str:
+    """Read a Zalo env var honoring the multiplex profile secret scope first.
+
+    Under a multiplexed gateway the profile's .env is NOT loaded into os.environ
+    (per-profile credential isolation), so plain os.getenv() sees nothing and the
+    adapter never passes check_requirements. agent.secret_scope.get_secret()
+    resolves profile-scoped secrets; fall back to os.getenv for standalone
+    gateways (launcher loads .env into the process env there). 2026-09-30.
+    """
+    val = ""
+    try:
+        from agent.secret_scope import get_secret as _scope_get
+        val = _scope_get(name) or ""
+    except Exception:
+        val = ""
+    return (val or os.getenv(name) or default).strip()
+
 def check_requirements() -> bool:
     """Check if Zalo is configured."""
-    token = os.getenv("ZALO_BOT_TOKEN", "").strip()
+    token = _resolve_zalo_secret("ZALO_BOT_TOKEN")
     return bool(token)
 
 
 def validate_config(config) -> bool:
     """Validate that the platform config has enough info to connect."""
     extra = getattr(config, "extra", {}) or {}
-    token = os.getenv("ZALO_BOT_TOKEN") or extra.get("bot_token", "")
+    token = _resolve_zalo_secret("ZALO_BOT_TOKEN", extra.get("bot_token", ""))
     return bool(token and token.strip())
 
 
 def is_connected(config) -> bool:
     """Check whether Zalo is configured (env or config.yaml)."""
     extra = getattr(config, "extra", {}) or {}
-    token = os.getenv("ZALO_BOT_TOKEN") or extra.get("bot_token", "")
+    token = _resolve_zalo_secret("ZALO_BOT_TOKEN", extra.get("bot_token", ""))
     return bool(token and token.strip())
 
 
@@ -1547,7 +1573,7 @@ def interactive_setup() -> None:
 
 def _env_enablement() -> dict | None:
     """Seed PlatformConfig.extra from env vars during gateway config load."""
-    token = os.getenv("ZALO_BOT_TOKEN", "").strip()
+    token = _resolve_zalo_secret("ZALO_BOT_TOKEN")
     if not token:
         return None
     seed: dict = {
@@ -1576,7 +1602,7 @@ async def _standalone_send(
     Used for cron delivery when the gateway is not running in-process.
     """
     extra = getattr(pconfig, "extra", {}) or {}
-    token = os.getenv("ZALO_BOT_TOKEN") or extra.get("bot_token", "")
+    token = _resolve_zalo_secret("ZALO_BOT_TOKEN", extra.get("bot_token", ""))
     if not token:
         return {"error": "Zalo standalone send: ZALO_BOT_TOKEN must be configured"}
 
@@ -1677,7 +1703,7 @@ def register(ctx):
         allow_update_command=True,
         platform_hint=(
             "You are chatting via Zalo. Zalo supports limited formatting "
-            "— replies are plain text: markdown (bold, headings, tables) is stripped automatically. "
+            "— **bold** and *italic* work, but complex markdown is stripped. "
             "Messages are limited to 2000 characters per message "
             "(long messages are automatically split). "
             "Keep responses concise and conversational. "
