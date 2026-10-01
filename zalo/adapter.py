@@ -18,6 +18,7 @@ Configuration in config.yaml:
             webhook_url: ""         # optional, overrides long-polling
             webhook_secret: ""      # required if webhook_url is set
             webhook_port: 8443      # port for webhook listener
+            webhook_host: "127.0.0.1"  # bind address (use "0.0.0.0" for all interfaces)
 
 Or via environment variables (overrides config.yaml):
     ZALO_BOT_TOKEN, ZALO_ALLOWED_USERS, ZALO_ALLOW_ALL_USERS,
@@ -27,6 +28,7 @@ Or via environment variables (overrides config.yaml):
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import logging
 import os
@@ -222,8 +224,16 @@ class _ZaloClient:
         """POST to an API endpoint and return parsed JSON."""
         await self._ensure_client()
         url = f"{self._base}/{endpoint}"
-        resp = await self._client.post(url, json=data or {})
-        resp.raise_for_status()
+        try:
+            resp = await self._client.post(url, json=data or {})
+            resp.raise_for_status()
+        except Exception as e:
+            # httpx error text includes the request URL, which embeds the
+            # bot token (/bot{token}/...). Re-raise with the token scrubbed.
+            msg = str(e)
+            if self.bot_token:
+                msg = msg.replace(self.bot_token, "***")
+            raise RuntimeError(f"{type(e).__name__}: {msg}") from None
         return resp.json()
 
     async def get_me(self) -> dict:
@@ -654,12 +664,15 @@ class ZaloAdapter(BasePlatformAdapter):
         if allow_all_env:
             self.allow_all = allow_all_env in ("1", "true", "yes")
         else:
-            self.allow_all = extra.get("allow_all", True)
+            self.allow_all = extra.get("allow_all", False)
 
         # Webhook mode
         self.webhook_url = extra.get("webhook_url", "")
         self.webhook_secret = extra.get("webhook_secret", "")
         self.webhook_port = int(extra.get("webhook_port", 8443))
+        # Loopback by default: run behind a TLS reverse proxy. Set
+        # webhook_host: "0.0.0.0" to listen on all interfaces.
+        self.webhook_host = str(extra.get("webhook_host", "127.0.0.1"))
 
         # Runtime state
         self._client: Optional[_ZaloClient] = None
@@ -841,7 +854,9 @@ class ZaloAdapter(BasePlatformAdapter):
         async def webhook_handler(request):
             # Verify secret token
             secret = request.headers.get(WEBHOOK_SECRET_HEADER, "")
-            if secret != self.webhook_secret:
+            if not hmac.compare_digest(
+                secret.encode("utf-8"), self.webhook_secret.encode("utf-8")
+            ):
                 return web.Response(status=403, text="Unauthorized")
 
             try:
@@ -855,15 +870,15 @@ class ZaloAdapter(BasePlatformAdapter):
                 return web.json_response({"ok": True})
             except Exception as e:
                 logger.warning("Zalo: webhook handler error: %s", e)
-                return web.json_response({"ok": False, "error": str(e)}, status=500)
+                return web.json_response({"ok": False, "error": "internal error"}, status=500)
 
         app.router.add_post("/webhook/zalo", webhook_handler)
 
         runner = web.AppRunner(app)
         await runner.setup()
-        site = web.TCPSite(runner, "0.0.0.0", self.webhook_port)
+        site = web.TCPSite(runner, self.webhook_host, self.webhook_port)
         await site.start()
-        logger.info("Zalo: webhook listening on port %d", self.webhook_port)
+        logger.info("Zalo: webhook listening on %s:%d", self.webhook_host, self.webhook_port)
 
         # Keep the task alive (runs as background task; cancelled on disconnect)
         try:
@@ -989,7 +1004,7 @@ class ZaloAdapter(BasePlatformAdapter):
                 text = text.replace(f"@{self._bot_display_name}", "").replace(f"{self._bot_display_name}", "").strip()
 
             # Auth check for group (check the user who sent it)
-            if not self._is_user_authorized(user_id):
+            if not self._passes_allowlist(user_id):
                 logger.debug("Zalo: ignoring group message from unauthorized user %s", user_id)
                 return
 
@@ -1044,7 +1059,7 @@ class ZaloAdapter(BasePlatformAdapter):
                 return
 
         # Auth check
-        if not self._is_user_authorized(user_id):
+        if not self._passes_allowlist(user_id):
             logger.debug("Zalo: ignoring message from unauthorized user %s", user_id)
             return
 
@@ -1089,6 +1104,12 @@ class ZaloAdapter(BasePlatformAdapter):
         cmd = slash["command"]
         args = slash["args"]
         spec = slash["spec"]
+
+        # Adapter-handled commands never reach Hermes' gateway authorization,
+        # so gate them here: only allowlisted users (or allow_all) may run them.
+        if not self._is_user_authorized(user_id):
+            logger.debug("Zalo: ignoring /%s from unauthorized user %s", cmd, user_id)
+            return
 
         # Admin-only check
         # For group commands, verify user is admin/owner in the group
@@ -1312,12 +1333,23 @@ class ZaloAdapter(BasePlatformAdapter):
         await self._send_text(chat_id, welcome)
 
     def _is_user_authorized(self, user_id: str) -> bool:
-        """Check if a user is allowed to interact with the bot."""
+        """Check if a user may run adapter-handled commands (default deny)."""
         if self.allow_all:
             return True
         if not self.allowed_users:
-            return True
+            return False
         return user_id in self.allowed_users
+
+    def _passes_allowlist(self, user_id: str) -> bool:
+        """Pre-filter for agent-bound messages.
+
+        These go through Hermes' gateway authorization (allowlist, pairing,
+        allow-all) in handle_message, so with no adapter allowlist configured
+        defer to it instead of dropping users that core pairing could admit.
+        """
+        if not self.allow_all and not self.allowed_users:
+            return True
+        return self._is_user_authorized(user_id)
 
     async def _dispatch_message(
         self,
@@ -1554,7 +1586,7 @@ def interactive_setup() -> None:
         return
     save_env_value("ZALO_BOT_TOKEN", token.strip())
 
-    if prompt_yes_no("Restrict access to specific user IDs?", False):
+    if prompt_yes_no("Restrict access to specific user IDs?", True):
         users = prompt(
             "Allowed Zalo user IDs (comma-separated)",
             default=get_env_value("ZALO_ALLOWED_USERS") or "",
@@ -1563,8 +1595,14 @@ def interactive_setup() -> None:
             save_env_value("ZALO_ALLOWED_USERS", users.strip())
         else:
             save_env_value("ZALO_ALLOWED_USERS", "")
-    else:
+        save_env_value("ZALO_ALLOW_ALL_USERS", "")
+    elif prompt_yes_no("Allow ALL Zalo users to use the bot (open access)?", False):
         save_env_value("ZALO_ALLOW_ALL_USERS", "true")
+        print_warning("Open access enabled — anyone can use your bot!")
+    else:
+        save_env_value("ZALO_ALLOW_ALL_USERS", "")
+        print_info("No allowlist: unknown users must be approved with")
+        print_info("  hermes pairing approve zalo <code>")
 
     print()
     print_success("Zalo configuration saved to ~/.hermes/.env")

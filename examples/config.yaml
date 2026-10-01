@@ -24,7 +24,7 @@ gateway:
         allowed_users: []
 
         # Allow all users (true/false). Overrides allowed_users.
-        allow_all: true
+        allow_all: false
 
         # === Webhook Mode (Optional) ===
         # If set, uses webhook instead of long-polling.
@@ -32,6 +32,9 @@ gateway:
         webhook_url: ""
         webhook_secret: ""
         webhook_port: 8443
+        # Bind address for the webhook listener. Default is loopback: put a
+        # TLS reverse proxy in front. Use "0.0.0.0" to listen on all interfaces.
+        webhook_host: "127.0.0.1"
 
 # Environment variable equivalents:
 #   ZALO_BOT_TOKEN         -> extra.bot_token
