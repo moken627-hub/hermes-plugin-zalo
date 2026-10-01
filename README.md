@@ -109,7 +109,12 @@ hermes gateway status
 |----------|----------|-------------|
 | `ZALO_BOT_TOKEN` | ✅ | Bot token from bot.zaloplatforms.com |
 | `ZALO_ALLOWED_USERS` | ❌ | Comma-separated user IDs (require `allowlist` policy) |
-| `ZALO_ALLOW_ALL_USERS` | ❌ | `true` to allow all users |
+| `ZALO_ALLOW_ALL_USERS` | ❌ | `true` to allow all users (anyone can use your bot) |
+
+Adapter slash commands (`/follow`, `/silent`, `/kick`, …) run only for users in
+`ZALO_ALLOWED_USERS` (or when `ZALO_ALLOW_ALL_USERS=true`). Messages to the
+agent are additionally authorized by the Hermes gateway: with no allowlist,
+unknown users must be approved via `hermes pairing approve zalo <code>`.
 | `ZALO_HOME_CHANNEL` | ❌ | Default Zalo chat ID for cron delivery |
 
 ### Access Policies
@@ -134,7 +139,12 @@ gateway:
         webhook_url: "https://your-domain.com/webhook/zalo"
         webhook_secret: <random-16-256-char-secret>
         webhook_port: 8443      # optional, default 8443
+        webhook_host: 127.0.0.1 # optional, default 127.0.0.1 (loopback)
 ```
+
+The listener speaks plain HTTP and binds to `127.0.0.1` by default; run it
+behind a TLS reverse proxy that forwards `POST /webhook/zalo`. Set
+`webhook_host: 0.0.0.0` only if you need it reachable on all interfaces.
 
 Then configure your webhook URL in the Zalo Bot Platform dashboard.
 
