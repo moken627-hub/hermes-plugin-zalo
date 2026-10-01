@@ -72,7 +72,9 @@ export ZALO_BOT_TOKEN="your_bot_token_here"
 hermes gateway setup zalo
 
 # Option C: config.yaml
-cat >> ~/.hermes/config.yaml << 'EOF'
+Add to `~/.hermes/config.yaml`:
+
+```yaml
 gateway:
   platforms:
     zalo:
@@ -80,7 +82,7 @@ gateway:
       extra:
         bot_token: "your_bot_token_here"
         dm_policy: "pairing"   # "pairing" | "open" | "allowlist"
-EOF
+```
 ```
 
 ### 4. Enable & restart
@@ -128,9 +130,9 @@ gateway:
     zalo:
       enabled: true
       extra:
-        bot_token: "your_token"
+        bot_token: <your-bot-token>
         webhook_url: "https://your-domain.com/webhook/zalo"
-        webhook_secret: "your-secret-16-256-chars"
+        webhook_secret: <random-16-256-char-secret>
         webhook_port: 8443      # optional, default 8443
 ```
 

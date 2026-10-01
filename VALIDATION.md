@@ -15,8 +15,7 @@ Recorded output of `hermes plugins validate` for the pinned release.
 ✓ declared hooks — matches registrations
 ✓ declared middleware — matches registrations
 ✓ built-in tool collisions — no tools to check
-✗ security scan — dangerous: hardcoded_secret (README.md:133), 
-hermes_config_mod_shell (README.md:75)
+✓ security scan — safe
 
-Validation failed.
+Validation passed.
 ```
