@@ -34,17 +34,20 @@ Instead, **report privately** by emailing: **jarvis.hermes.ai@gmail.com**
 - Your `ZALO_BOT_TOKEN` is a **secret credential** — treat it like a password
 - Never commit it to version control
 - Use environment variables or a secrets manager in production
-- The token is redacted in all log output (`1234...5678`)
+- The raw token is replaced with `***` when an API error is surfaced (the
+  token embedded in the request URL is scrubbed the same way)
 
 ### 🚫 Injection Prevention
 
-- All incoming user text is validated before processing
-- Chat IDs are sanitized to prevent injection attacks
+- Incoming chat IDs are passed through to the Zalo Bot API as-is; they are
+  restricted to `[A-Za-z0-9_-]` before being used to build local file paths
 - Webhook mode validates the `X-Bot-Api-Secret-Token` header
 
 ### 📋 Access Control
 
-- Default policy (`pairing`) requires user approval via code
+- Default policy (`pairing`) is gated by Hermes core pairing: unknown DM users
+  must be approved with `hermes pairing approve zalo <code>`; the adapter-side
+  code sent on first contact is only a self-served captcha, not an approval
 - Allowlist mode restricts access to known user IDs
 - Unsupported message types are silently ignored (not forwarded to the agent)
 

@@ -24,7 +24,7 @@ A **platform plugin** for [Hermes Agent](https://github.com/NousResearch/hermes-
 | ⌨️ Typing indicator (`sendChatAction`) | ✅ |
 | 🔄 Long-polling (`getUpdates`) | ✅ |
 | 🌐 Webhook mode (via aiohttp) | ✅ |
-| 🔐 DM Pairing approval (code-based) | ✅ |
+| 🔐 DM captcha + core pairing approval | ✅ |
 | 📋 Allowlist / Open access policies | ✅ |
 | 📬 Cron delivery (`deliver=zalo`) | ✅ |
 | ⚙️ Interactive setup wizard (`hermes gateway setup`) | ✅ |
@@ -121,7 +121,7 @@ unknown users must be approved via `hermes pairing approve zalo <code>`.
 
 | Policy | Description |
 |--------|-------------|
-| `pairing` (default) | New users receive a 6-digit code to approve access. Code expires in 1 hour. |
+| `pairing` (default) | New users receive a 6-digit captcha code to prove they can read the chat (expires in 1 hour). Real approval is Hermes core pairing: `hermes pairing approve zalo <code>`. |
 | `open` | Any user can message the bot |
 | `allowlist` | Only users in `allowed_users` can message |
 
@@ -236,7 +236,7 @@ python -c "from gateway.platforms.base import BasePlatformAdapter; print('OK')"
 - Photo sending
 - Typing indicator
 - Long-polling & webhook modes
-- DM pairing approval
+- DM captcha challenge + Hermes core pairing approval
 - Allowlist/Open access policies
 - Cron delivery support
 - Interactive setup wizard

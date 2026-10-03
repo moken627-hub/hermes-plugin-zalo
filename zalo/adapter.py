@@ -33,6 +33,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import time
 from datetime import datetime
 from pathlib import Path
@@ -54,6 +55,8 @@ from gateway.platforms.base import (
 from gateway.session import SessionSource
 from gateway.config import PlatformConfig, Platform
 
+from hermes_constants import get_hermes_home
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -71,12 +74,22 @@ WARN_MAX_WARNINGS = 3
 WARN_EXPIRY_SECONDS = 604800  # 1 week
 CRM_DATA_DIR = os.environ.get(
     "ZALO_CRM_DIR",
-    str(Path.home() / ".hermes" / "zalo-crm"),
+    str(get_hermes_home() / "zalo-crm"),
 )
 HISTORY_DIR = os.environ.get(
     "ZALO_HISTORY_DIR",
-    str(Path.home() / ".hermes" / "zalo-history"),
+    str(get_hermes_home() / "zalo-history"),
 )
+
+# Chat/group IDs come from the wire; restrict them before they are used to
+# build local file paths (defence against traversal / odd filenames).
+_SAFE_ID_RE = re.compile(r"[^A-Za-z0-9_-]")
+
+
+def _safe_path_component(identifier: str) -> str:
+    """Reduce a chat/group ID to [A-Za-z0-9_-] for local file names."""
+    sanitized = _SAFE_ID_RE.sub("_", str(identifier))[:128]
+    return sanitized or "unknown"
 
 # ── Slash commands registry ───────────────────────────────────────
 SLASH_COMMANDS = {
@@ -336,10 +349,22 @@ class _WarnSystem:
 
 
 class _GroupManager:
-    """Group management via Zalo Bot API."""
+    """Group management via Zalo Bot API.
 
-    def __init__(self, client: Any) -> None:
-        self._client = client
+    The HTTP client does not exist until ``connect()`` creates it, so the
+    manager holds the adapter and resolves the live client lazily on every
+    call instead of caching a ``None`` reference from ``__init__``.
+    """
+
+    def __init__(self, adapter: Any) -> None:
+        self._adapter = adapter
+
+    @property
+    def _client(self) -> Any:
+        client = getattr(self._adapter, "_client", None)
+        if client is None:
+            raise RuntimeError("Zalo: client not connected (group API unavailable)")
+        return client
 
     async def create_group(self, name: str, description: str = "",
                            join_type: str = "anyone",
@@ -438,7 +463,7 @@ class _GroupSettings:
 
     SETTINGS_FILE = os.environ.get(
         "ZALO_SETTINGS_DIR",
-        str(Path.home() / ".hermes" / "zalo-settings"),
+        str(get_hermes_home() / "zalo-settings"),
     )
 
     def __init__(self) -> None:
@@ -446,7 +471,7 @@ class _GroupSettings:
         self._dir.mkdir(parents=True, exist_ok=True)
 
     def _filepath(self, group_id: str) -> Path:
-        return self._dir / f"{group_id}.json"
+        return self._dir / f"{_safe_path_component(group_id)}.json"
 
     def _load(self, group_id: str) -> Dict[str, Any]:
         filepath = self._filepath(group_id)
@@ -519,7 +544,7 @@ class _ChatHistorySync:
     def flush(self, group_id: str) -> int:
         if group_id not in self._buffer:
             return 0
-        filepath = self._dir / f"{group_id}.jsonl"
+        filepath = self._dir / f"{_safe_path_component(group_id)}.jsonl"
         messages = self._buffer.pop(group_id, [])
         with open(filepath, "a", encoding="utf-8") as f:
             for msg in messages:
@@ -527,7 +552,7 @@ class _ChatHistorySync:
         return len(messages)
 
     def get_recent(self, group_id: str, limit: int = 50) -> List[Dict[str, Any]]:
-        filepath = self._dir / f"{group_id}.jsonl"
+        filepath = self._dir / f"{_safe_path_component(group_id)}.jsonl"
         if not filepath.exists():
             return []
         messages = []
@@ -556,7 +581,7 @@ class _CRMContacts:
         self._dir.mkdir(parents=True, exist_ok=True)
 
     def _filepath(self, group_id: str) -> Path:
-        return self._dir / f"{group_id}_contacts.json"
+        return self._dir / f"{_safe_path_component(group_id)}_contacts.json"
 
     def _load(self, filepath: Path) -> Dict[str, Any]:
         if not filepath.exists():
@@ -648,7 +673,6 @@ class ZaloAdapter(BasePlatformAdapter):
         # Bot token (env overrides config.yaml)
         self.bot_token = _resolve_zalo_secret("ZALO_BOT_TOKEN", extra.get("bot_token", ""))
         self.bot_token = self.bot_token.strip()
-        self._redacted_token = self._redact_token(self.bot_token)
 
         # DM policy (env var overrides config.yaml)
         self.dm_policy = os.getenv("ZALO_DM_POLICY") or extra.get("dm_policy", "pairing")
@@ -682,18 +706,25 @@ class ZaloAdapter(BasePlatformAdapter):
         self._bot_id: str = ""
         self._bot_name: str = ""
         self._bot_display_name: str = ""
-        self._pending_approvals: Dict[str, dict] = {}  # chat_id -> approval info
+        self._pending_approvals: Dict[str, dict] = {}  # chat_id -> captcha info
+        self._captcha_passed: set = set()  # chat_ids that solved the captcha
 
-        # Moderation & group management instances
+        # Moderation & group management instances. _GroupManager resolves
+        # self._client lazily (client is only created in connect()).
         self._anti_spam = _AntiSpam()
         self._warn_system = _WarnSystem()
-        self._group_manager = _GroupManager(self._client)
+        self._group_manager = _GroupManager(self)
         self._history_sync = _ChatHistorySync()
         self._crm = _CRMContacts()
         self._group_settings = _GroupSettings()
 
     def _redact_token(self, token: str) -> str:
-        """Redact bot token for logging (show first 4 chars + last 4)."""
+        """Placeholder kept for callers wanting a display form of the token.
+
+        Note: the plugin's actual redaction path replaces the raw token with
+        ``***`` in error text (see ``_ZaloClient._post``); this helper is not
+        part of any log output.
+        """
         if len(token) <= 12:
             return token[:4] + "..." + token[-4:] if len(token) > 8 else "***"
         return token[:4] + "..." + token[-4:]
@@ -1021,41 +1052,43 @@ class ZaloAdapter(BasePlatformAdapter):
             return
 
         # ── DM handling ─────────────────────────────────────────────────
-        # DM pairing approval flow (only for PRIVATE chats)
-        if self.dm_policy == "pairing":
+        # DM pairing approval flow (only for PRIVATE chats).
+        # The real approval is Hermes core pairing (`hermes pairing approve
+        # zalo <code>`). The adapter code below is only a self-served captcha:
+        # it proves the requester can read the chat and cuts drive-by spam,
+        # it never grants access on its own.
+        if self.dm_policy == "pairing" and chat_id not in self._captcha_passed:
             if chat_id not in self._pending_approvals:
-                # First contact — generate pairing code
-                code = str(int(time.time()))[-6:]
+                # First contact — generate a random captcha code
+                code = f"{secrets.randbelow(10**6):06d}"
                 self._pending_approvals[chat_id] = {
                     "code": code,
                     "user_id": user_id,
                     "user_name": user_name,
                     "expires_at": time.time() + 3600,  # 1 hour
                 }
-                # Send pairing code
-                await self._send_pairing_code(chat_id, code, user_name)
+                # Send captcha code
+                await self._send_captcha_code(chat_id, code, user_name)
                 return
 
-            # Check if approved or still pending
+            # Check if the message is the captcha code
             approval = self._pending_approvals[chat_id]
-            if approval.get("code"):
-                # Still pending — check if the message is the approval code
-                text = (message.get("text") or "").strip()
-                if text == approval["code"]:
-                    # Approved! Remove pairing code
-                    approval.pop("code", None)
-                    await self._send_text(chat_id, f"✅ Xác thực thành công! Bạn có thể trò chuyện với bot.")
-                    # Fall through to handle this message too (after approval)
-                else:
-                    await self._send_text(
-                        chat_id,
-                        f"⚠️ Vui lòng nhập mã xác thực **{approval['code']}** để bắt đầu trò chuyện."
-                    )
-                    return
-
-            # Check if expired
-            if approval.get("expires_at", 0) < time.time():
+            text = (message.get("text") or "").strip()
+            if text == approval["code"]:
+                # Captcha passed — mark and fall through to handle the message
+                self._captcha_passed.add(chat_id)
                 self._pending_approvals.pop(chat_id, None)
+                await self._send_text(chat_id, "✅ Xác thực thành công! Bạn có thể trò chuyện với bot.")
+            else:
+                if approval.get("expires_at", 0) < time.time():
+                    self._pending_approvals.pop(chat_id, None)
+                    self._captcha_passed.discard(chat_id)
+                    await self._send_text(chat_id, "⚠️ Mã xác thực đã hết hạn. Gửi tin nhắn bất kỳ để nhận mã mới.")
+                    return
+                await self._send_text(
+                    chat_id,
+                    f"⚠️ Vui lòng nhập mã xác thực **{approval['code']}** để bắt đầu trò chuyện."
+                )
                 return
 
         # Auth check
@@ -1321,11 +1354,15 @@ class ZaloAdapter(BasePlatformAdapter):
             logger.error("Zalo: slash command error: %s", e)
             await self._send_text(chat_id, f"❌ Lỗi xử lý lệnh: {str(e)[:100]}")
 
-    async def _send_pairing_code(self, chat_id: str, code: str, user_name: str) -> None:
-        """Send a pairing approval code to a new user."""
+    async def _send_captcha_code(self, chat_id: str, code: str, user_name: str) -> None:
+        """Send the self-served captcha code to a new DM user.
+
+        This is NOT an approval: real access is granted by Hermes core
+        pairing (`hermes pairing approve zalo <code>`).
+        """
         welcome = (
             f"Xin chào {user_name}! 👋\n\n"
-            f"Để xác thực và bắt đầu trò chuyện với bot, "
+            f"Để bắt đầu trò chuyện với bot, "
             f"vui lòng gửi mã xác thực sau:\n\n"
             f"**{code}**\n\n"
             f"Mã có hiệu lực trong 1 giờ."

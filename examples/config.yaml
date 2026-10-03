@@ -14,7 +14,8 @@ gateway:
 
         # === Access Control ===
         # Available policies:
-        #   "pairing"   — new users get a 6-digit code to approve (default)
+        #   "pairing"   — new users get a 6-digit captcha code; real approval
+        #                 happens via `hermes pairing approve` (default)
         #   "open"      — any user can message
         #   "allowlist" — only users in allowed_users can message
         dm_policy: "pairing"
