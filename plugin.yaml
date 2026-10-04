@@ -1,7 +1,7 @@
 name: zalo-platform
 label: Zalo
 kind: platform
-version: 2.1.2
+version: 2.1.3
 description: >
   Zalo Bot Platform gateway adapter for Hermes Agent.
   Connects to Zalo via the Bot API (bot.zaloplatforms.com) and relays
@@ -10,9 +10,8 @@ description: >
 
   Zero extra dependencies — uses httpx, already a Hermes Agent dependency.
 
-  v2.0 adds: group management (create/kick/admin/poll/pin/invite),
-  slash commands (/menu, /warn, /kick, /promote, /poll, /pin, /noi-quy...),
-  zero-token anti-spam + warn system, chat history sync, CRM contacts.
+  Slash commands (/menu, /warn, /kick, /promote, /poll, /pin, /noi-quy...),
+  zero-token anti-spam + warn system, chat history sync.
 author: Moken
 repository: "https://github.com/moken627-hub/hermes-plugin-zalo"
 requires_env:
@@ -37,10 +36,6 @@ optional_env:
   - name: ZALO_HOME_CHANNEL_NAME
     description: "Display name for the Zalo home channel"
     prompt: "Home channel display name"
-    password: false
-  - name: ZALO_CRM_DIR
-    description: "Directory for CRM contact data (default: ~/.hermes/zalo-crm)"
-    prompt: "CRM data directory"
     password: false
   - name: ZALO_CRM_DIR
     description: "Directory for CRM contact data (default: ~/.hermes/zalo-crm)"

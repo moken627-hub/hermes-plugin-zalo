@@ -110,12 +110,12 @@ hermes gateway status
 | `ZALO_BOT_TOKEN` | ✅ | Bot token from bot.zaloplatforms.com |
 | `ZALO_ALLOWED_USERS` | ❌ | Comma-separated user IDs (require `allowlist` policy) |
 | `ZALO_ALLOW_ALL_USERS` | ❌ | `true` to allow all users (anyone can use your bot) |
+| `ZALO_HOME_CHANNEL` | ❌ | Default Zalo chat ID for cron delivery |
 
 Adapter slash commands (`/follow`, `/silent`, `/kick`, …) run only for users in
 `ZALO_ALLOWED_USERS` (or when `ZALO_ALLOW_ALL_USERS=true`). Messages to the
 agent are additionally authorized by the Hermes gateway: with no allowlist,
 unknown users must be approved via `hermes pairing approve zalo <code>`.
-| `ZALO_HOME_CHANNEL` | ❌ | Default Zalo chat ID for cron delivery |
 
 ### Access Policies
 

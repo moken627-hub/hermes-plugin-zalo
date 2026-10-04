@@ -715,7 +715,6 @@ class ZaloAdapter(BasePlatformAdapter):
         self._warn_system = _WarnSystem()
         self._group_manager = _GroupManager(self)
         self._history_sync = _ChatHistorySync()
-        self._crm = _CRMContacts()
         self._group_settings = _GroupSettings()
 
     def _redact_token(self, token: str) -> str:
@@ -1074,6 +1073,11 @@ class ZaloAdapter(BasePlatformAdapter):
             # Check if the message is the captcha code
             approval = self._pending_approvals[chat_id]
             text = (message.get("text") or "").strip()
+            if approval.get("expires_at", 0) < time.time():
+                self._pending_approvals.pop(chat_id, None)
+                self._captcha_passed.discard(chat_id)
+                await self._send_text(chat_id, "⚠️ Mã xác thực đã hết hạn. Gửi tin nhắn bất kỳ để nhận mã mới.")
+                return
             if text == approval["code"]:
                 # Captcha passed — mark and fall through to handle the message
                 self._captcha_passed.add(chat_id)
